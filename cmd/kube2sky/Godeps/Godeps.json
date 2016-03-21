@@ -1,8 +1,0 @@
-{
-	"ImportPath": "github.com/gravitational/kube2sky/cmd/kube2sky",
-	"GoVersion": "go1.5",
-	"Packages": [
-		"./cmd/kube2sky/..."
-	],
-	"Deps": []
-}
