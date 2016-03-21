@@ -43,7 +43,9 @@ mutation (insertion or removal of a dns entry) before giving up and crashing.
 ## Note
 
 This is a mirror from the official repository at https://github.com/kubernetes/kubernetes/tree/master/cluster/addons/dns/kube2sky.
-This mirror exists to enable support of several missing features in the official repository.
+
+This mirror exists solely to enable support of several features absent in the official repository.
+
 Currently, it implements TLS support for etcd.
 
 [![Analytics](https://kubernetes-site.appspot.com/UA-36037335-10/GitHub/cluster/addons/dns/kube2sky/README.md?pixel)]()
