@@ -55,9 +55,9 @@ func (ec *fakeEtcdClient) Delete(context context.Context, key string, options *e
 func (ec *fakeEtcdClient) Get(context context.Context, key string, options *etcd.GetOptions) (*etcd.Response, error) {
 	values := ec.GetAll(key)
 	if len(values) == 0 {
-		return &etcd.Response{}, nil
+		return nil, nil
 	}
-	node := &etcd.Node{Key: key}
+	node := &etcd.Node{Key: key, Value: values[0]}
 	return &etcd.Response{Node: node}, nil
 }
 
@@ -121,10 +121,6 @@ func getHostPortFromString(data string) (*hostPort, error) {
 	var res hostPort
 	err := json.Unmarshal([]byte(data), &res)
 	return &res, err
-}
-
-func newTestContext() kapi.Context {
-	return kapi.WithNamespace(kapi.NewContext(), "test")
 }
 
 func assertDnsServiceEntryInEtcd(t *testing.T, ec *fakeEtcdClient, serviceName, namespace string, expectedHostPort *hostPort) {

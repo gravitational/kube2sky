@@ -23,7 +23,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -34,7 +33,6 @@ import (
 	"time"
 
 	etcd "github.com/coreos/etcd/client"
-	"github.com/coreos/etcd/pkg/transport"
 	"github.com/golang/glog"
 	skymsg "github.com/skynetservices/skydns/msg"
 	flag "github.com/spf13/pflag"
@@ -49,7 +47,7 @@ import (
 	kframework "k8s.io/kubernetes/pkg/controller/framework"
 	kselector "k8s.io/kubernetes/pkg/fields"
 	etcdstorage "k8s.io/kubernetes/pkg/storage/etcd"
-	"k8s.io/kubernetes/pkg/util"
+	utilflag "k8s.io/kubernetes/pkg/util/flag"
 	"k8s.io/kubernetes/pkg/util/validation"
 	"k8s.io/kubernetes/pkg/util/wait"
 )
@@ -60,18 +58,17 @@ const kubernetesSvcName = "kubernetes"
 var (
 	argDomain              = flag.String("domain", "cluster.local", "domain under which to create names")
 	argEtcdMutationTimeout = flag.Duration("etcd-mutation-timeout", 10*time.Second, "crash after retrying etcd mutation for a specified duration")
-	argEtcdServer          = flag.String("etcd-server", "http://127.0.0.1:4001", "URL to etcd server")
-	argEtcdCAFile          = flag.String("etcd-cafile", "", "Certificate Authority file to secure etcd communication")
-	argEtcdCertFile        = flag.String("etcd-certfile", "", "TLS certificate file to secure etcd communication")
-	argEtcdKeyFile         = flag.String("etcd-keyfile", "", "TLS key file to secure etcd communication")
+	argEtcdServers         = flag.StringSlice("etcd-servers", []string{"http://127.0.0.1:4001"}, "List of etcd servers to watch (http://ip:port), comma separated")
+	argEtcdCAFile          = flag.String("etcd-cafile", "", "SSL Certificate Authority file used to secure etcd communication")
+	argEtcdCertFile        = flag.String("etcd-certfile", "", "SSL certification file used to secure etcd communication")
+	argEtcdKeyFile         = flag.String("etcd-keyfile", "", "SSL key file used to secure etcd communication")
+	argEtcdQuorum          = flag.Bool("etcd-quorum-read", false, "If true, enable quorum read")
 	argKubecfgFile         = flag.String("kubecfg-file", "", "Location of kubecfg file for access to kubernetes master service; --kube-master-url overrides the URL part of this; if neither this nor --kube-master-url are provided, defaults to service account tokens")
 	argKubeMasterURL       = flag.String("kube-master-url", "", "URL to reach kubernetes master. Env variables in this flag will be expanded.")
 	healthzPort            = flag.Int("healthz-port", 8081, "port on which to serve a kube2sky HTTP readiness probe.")
 )
 
 const (
-	// Maximum number of attempts to connect to etcd server.
-	maxConnectAttempts = 12
 	// pollInterval defines the amount of time between etcd connection attempts
 	pollInterval = 5 * time.Second
 	// pollTimeout defines the total amount of time to attempt connecting to etcd
@@ -82,11 +79,7 @@ const (
 	serviceSubdomain = "svc"
 	// A subdomain added to the user specified dmoain for all pods.
 	podSubdomain = "pod"
-	// kube2skyContext is the name of the context used with etcd API
-	kube2skyContext = "kube2sky"
 )
-
-type etcdConfig etcdstorage.EtcdConfig
 
 type etcdKeysAPI interface {
 	Set(context context.Context, key, value string, options *etcd.SetOptions) (*etcd.Response, error)
@@ -100,10 +93,11 @@ type nameNamespace struct {
 }
 
 // newKube2Sky creates a new instance of Kubernetes to SkyDNS bridge
-func newKube2Sky(config *etcdConfig, domain string, mutationTimeout time.Duration) (ks *kube2sky, err error) {
+func newKube2Sky(config *etcdstorage.EtcdConfig, domain string, mutationTimeout time.Duration) (ks *kube2sky, err error) {
 	ks = &kube2sky{
 		domain:              domain,
 		etcdMutationTimeout: mutationTimeout,
+		quorum:              config.Quorum,
 	}
 
 	var etcdClient etcd.Client
@@ -129,20 +123,23 @@ type kube2sky struct {
 	podsStore kcache.Store
 	// Lock for controlling access to headless services.
 	mlock sync.Mutex
+	// If true, perform quorum read.
+	quorum bool
 }
 
 // Removes 'subdomain' from etcd.
 func (ks *kube2sky) removeDNS(subdomain string) error {
 	glog.V(2).Infof("Removing %s from DNS", subdomain)
-	ctx := newContext()
+	ctx := context.Background()
 	opts := &etcd.GetOptions{
 		Recursive: true,
+		Quorum:    ks.quorum,
 	}
 	resp, err := ks.etcdKeysAPI.Get(ctx, skymsg.Path(subdomain), opts)
 	if err != nil {
 		return err
 	}
-	if resp.Node == nil {
+	if emptyResponse(resp) {
 		glog.V(2).Infof("Subdomain %q does not exist in etcd", subdomain)
 		return nil
 	}
@@ -155,7 +152,7 @@ func (ks *kube2sky) removeDNS(subdomain string) error {
 
 func (ks *kube2sky) writeSkyRecord(subdomain string, data string) error {
 	// Set with no TTL, and hope that kubernetes events are accurate.
-	ctx := newContext()
+	ctx := context.Background()
 	opts := &etcd.SetOptions{}
 	_, err := ks.etcdKeysAPI.Set(ctx, skymsg.Path(subdomain), data, opts)
 	return err
@@ -186,6 +183,10 @@ func (ks *kube2sky) newHeadlessService(subdomain string, service *kapi.Service) 
 		return ks.generateRecordsForHeadlessService(subdomain, e, service)
 	}
 	return nil
+}
+
+func emptyResponse(resp *etcd.Response) bool {
+	return resp == nil || resp.Node == nil || len(resp.Node.Value) == 0
 }
 
 func getSkyMsg(ip string, port int) *skymsg.Service {
@@ -479,12 +480,12 @@ func (ks *kube2sky) updateService(oldObj, newObj interface{}) {
 	ks.newService(newObj)
 }
 
-func newEtcdClient(config *etcdConfig) (client etcd.Client, err error) {
-	ctx := newContext()
+func newEtcdClient(config *etcdstorage.EtcdConfig) (client etcd.Client, err error) {
+	ctx := context.Background()
 	// loop until we have > 0 machines && machines[0] != ""
 	poll, timeout := pollInterval, pollTimeout
 	if err := wait.Poll(poll, timeout, func() (bool, error) {
-		if client, err = config.newClient(); err != nil {
+		if client, err = config.NewEtcdClient(); err != nil {
 			glog.Infof("cannot create etcd client: %v", err)
 			return false, nil
 		}
@@ -512,48 +513,6 @@ func expandKubeMasterURL() (string, error) {
 		return "", fmt.Errorf("invalid --kube-master-url specified %s", *argKubeMasterURL)
 	}
 	return parsedURL.String(), nil
-}
-
-func (c *etcdConfig) newClient() (client etcd.Client, err error) {
-	transport, err := c.newTransport()
-	if err != nil {
-		return nil, err
-	}
-
-	client, err = etcd.New(etcd.Config{
-		Endpoints: c.ServerList,
-		Transport: transport,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	return client, nil
-}
-
-func (c *etcdConfig) newTransport() (*http.Transport, error) {
-	info := transport.TLSInfo{
-		CAFile:   c.CAFile,
-		CertFile: c.CertFile,
-		KeyFile:  c.KeyFile,
-	}
-	tlsConfig, err := info.ClientConfig()
-	if err != nil {
-		return nil, err
-	}
-
-	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		Dial: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).Dial,
-		TLSHandshakeTimeout: 10 * time.Second,
-		MaxIdleConnsPerHost: 500,
-		TLSClientConfig:     tlsConfig,
-	}
-
-	return transport, nil
 }
 
 // TODO: evaluate using pkg/client/clientcmd
@@ -700,29 +659,18 @@ func setupHealthzHandlers(ks *kube2sky) {
 }
 
 func validateArgs() error {
-	if *argEtcdServer == "" {
+	if len(*argEtcdServers) == 0 {
 		return fmt.Errorf("etcd server required")
 	}
 	if *argDomain == "" {
 		return fmt.Errorf("cluster domain required")
 	}
-	parsed, err := url.Parse(*argEtcdServer)
-	if err != nil {
-		return err
-	}
-	if parsed.Scheme == "https" && (*argEtcdCertFile == "" || *argEtcdKeyFile == "") {
-		return fmt.Errorf("both cert and key files must be provided for HTTPS")
-	}
 	// TODO: Validate other input flags.
 	return nil
 }
 
-func newContext() context.Context {
-	return kapi.WithNamespace(kapi.NewContext(), kube2skyContext)
-}
-
 func main() {
-	flag.CommandLine.SetNormalizeFunc(util.WarnWordSepNormalizeFunc)
+	flag.CommandLine.SetNormalizeFunc(utilflag.WarnWordSepNormalizeFunc)
 	flag.Parse()
 	var err error
 	setupSignalHandlers()
@@ -734,8 +682,9 @@ func main() {
 		domain = fmt.Sprintf("%s.", domain)
 	}
 
-	etcdConfig := &etcdConfig{
-		ServerList: []string{*argEtcdServer},
+	etcdConfig := &etcdstorage.EtcdConfig{
+		ServerList: *argEtcdServers,
+		Quorum:     *argEtcdQuorum,
 		CAFile:     *argEtcdCAFile,
 		CertFile:   *argEtcdCertFile,
 		KeyFile:    *argEtcdKeyFile,
