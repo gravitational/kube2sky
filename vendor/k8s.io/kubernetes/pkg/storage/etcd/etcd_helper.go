@@ -34,6 +34,8 @@ import (
 	"k8s.io/kubernetes/pkg/storage/etcd/metrics"
 	etcdutil "k8s.io/kubernetes/pkg/storage/etcd/util"
 	"k8s.io/kubernetes/pkg/util"
+	utilcache "k8s.io/kubernetes/pkg/util/cache"
+	utilnet "k8s.io/kubernetes/pkg/util/net"
 	"k8s.io/kubernetes/pkg/watch"
 
 	etcd "github.com/coreos/etcd/client"
@@ -55,7 +57,7 @@ func (c *EtcdStorageConfig) GetType() string {
 
 // implements storage.Config
 func (c *EtcdStorageConfig) NewStorage() (storage.Interface, error) {
-	etcdClient, err := c.Config.newEtcdClient()
+	etcdClient, err := c.Config.NewEtcdClient()
 	if err != nil {
 		return nil, err
 	}
@@ -72,7 +74,7 @@ type EtcdConfig struct {
 	Quorum     bool
 }
 
-func (c *EtcdConfig) newEtcdClient() (etcd.Client, error) {
+func (c *EtcdConfig) NewEtcdClient() (etcd.Client, error) {
 	t, err := c.newHttpTransport()
 	if err != nil {
 		return nil, err
@@ -102,7 +104,7 @@ func (c *EtcdConfig) newHttpTransport() (*http.Transport, error) {
 
 	// Copied from etcd.DefaultTransport declaration.
 	// TODO: Determine if transport needs optimization
-	tr := &http.Transport{
+	tr := utilnet.SetTransportDefaults(&http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		Dial: (&net.Dialer{
 			Timeout:   30 * time.Second,
@@ -111,7 +113,7 @@ func (c *EtcdConfig) newHttpTransport() (*http.Transport, error) {
 		TLSHandshakeTimeout: 10 * time.Second,
 		MaxIdleConnsPerHost: 500,
 		TLSClientConfig:     cfg,
-	}
+	})
 
 	return tr, nil
 }
@@ -127,7 +129,7 @@ func NewEtcdStorage(client etcd.Client, codec runtime.Codec, prefix string, quor
 		copier:         api.Scheme,
 		pathPrefix:     path.Join("/", prefix),
 		quorum:         quorum,
-		cache:          util.NewCache(maxEtcdCacheEntries),
+		cache:          utilcache.NewCache(maxEtcdCacheEntries),
 	}
 }
 
@@ -154,7 +156,7 @@ type etcdHelper struct {
 	// support multi-object transaction that will result in many objects with the same index.
 	// Number of entries stored in the cache is controlled by maxEtcdCacheEntries constant.
 	// TODO: Measure how much this cache helps after the conversion code is optimized.
-	cache util.Cache
+	cache utilcache.Cache
 }
 
 func init() {
@@ -215,7 +217,7 @@ func (h *etcdHelper) Create(ctx context.Context, key string, obj, out runtime.Ob
 	metrics.RecordEtcdRequestLatency("create", getTypeName(obj), startTime)
 	trace.Step("Object created")
 	if err != nil {
-		return err
+		return toStorageErr(err, key, 0)
 	}
 	if out != nil {
 		if _, err := conversion.EnforcePtr(out); err != nil {
@@ -262,7 +264,7 @@ func (h *etcdHelper) Set(ctx context.Context, key string, obj, out runtime.Objec
 		response, err = h.etcdKeysAPI.Set(ctx, key, string(data), &opts)
 		metrics.RecordEtcdRequestLatency("compareAndSwap", getTypeName(obj), startTime)
 		if err != nil {
-			return err
+			return toStorageErr(err, key, int64(version))
 		}
 	}
 	if create {
@@ -274,7 +276,7 @@ func (h *etcdHelper) Set(ctx context.Context, key string, obj, out runtime.Objec
 		}
 		response, err = h.etcdKeysAPI.Set(ctx, key, string(data), &opts)
 		if err != nil {
-			return err
+			return toStorageErr(err, key, 0)
 		}
 		metrics.RecordEtcdRequestLatency("create", getTypeName(obj), startTime)
 	}
@@ -308,7 +310,7 @@ func (h *etcdHelper) Delete(ctx context.Context, key string, out runtime.Object)
 			_, _, err = h.extractObj(response, err, out, false, true)
 		}
 	}
-	return err
+	return toStorageErr(err, key, 0)
 }
 
 // Implements storage.Interface.
@@ -365,12 +367,11 @@ func (h *etcdHelper) bodyAndExtractObj(ctx context.Context, key string, objPtr r
 
 	response, err := h.etcdKeysAPI.Get(ctx, key, opts)
 	metrics.RecordEtcdRequestLatency("get", getTypeName(objPtr), startTime)
-
 	if err != nil && !etcdutil.IsEtcdNotFound(err) {
-		return "", nil, nil, err
+		return "", nil, nil, toStorageErr(err, key, 0)
 	}
 	body, node, err = h.extractObj(response, err, objPtr, ignoreNotFound, false)
-	return body, node, response, err
+	return body, node, response, toStorageErr(err, key, 0)
 }
 
 func (h *etcdHelper) extractObj(response *etcd.Response, inErr error, objPtr runtime.Object, ignoreNotFound, prevNode bool) (body string, node *etcd.Node, err error) {
@@ -432,7 +433,7 @@ func (h *etcdHelper) GetToList(ctx context.Context, key string, filter storage.F
 		if etcdutil.IsEtcdNotFound(err) {
 			return nil
 		}
-		return err
+		return toStorageErr(err, key, 0)
 	}
 
 	nodes := make([]*etcd.Node, 0)
@@ -539,7 +540,7 @@ func (h *etcdHelper) listEtcdNode(ctx context.Context, key string) ([]*etcd.Node
 		if etcdutil.IsEtcdNotFound(err) {
 			return nodes, index, nil
 		} else {
-			return nodes, index, err
+			return nodes, index, toStorageErr(err, key, 0)
 		}
 	}
 	return result.Node.Nodes, result.Index, nil
@@ -621,7 +622,7 @@ func (h *etcdHelper) GuaranteedUpdate(ctx context.Context, key string, ptrToType
 				continue
 			}
 			_, _, err = h.extractObj(response, err, ptrToType, false, false)
-			return err
+			return toStorageErr(err, key, 0)
 		}
 
 		if string(data) == origBody {
@@ -645,7 +646,7 @@ func (h *etcdHelper) GuaranteedUpdate(ctx context.Context, key string, ptrToType
 			continue
 		}
 		_, _, err = h.extractObj(response, err, ptrToType, false, false)
-		return err
+		return toStorageErr(err, key, int64(index))
 	}
 }
 
@@ -708,5 +709,23 @@ func (h *etcdHelper) addToCache(index uint64, obj runtime.Object) {
 	isOverwrite := h.cache.Add(index, objCopy)
 	if !isOverwrite {
 		metrics.ObserveNewEntry()
+	}
+}
+
+func toStorageErr(err error, key string, rv int64) error {
+	if err == nil {
+		return nil
+	}
+	switch {
+	case etcdutil.IsEtcdNotFound(err):
+		return storage.NewKeyNotFoundError(key, rv)
+	case etcdutil.IsEtcdNodeExist(err):
+		return storage.NewKeyExistsError(key, rv)
+	case etcdutil.IsEtcdTestFailed(err):
+		return storage.NewResourceVersionConflictsError(key, rv)
+	case etcdutil.IsEtcdUnreachable(err):
+		return storage.NewUnreachableError(key, rv)
+	default:
+		return err
 	}
 }

@@ -23,7 +23,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/url"
@@ -34,11 +33,12 @@ import (
 	"syscall"
 	"time"
 
+	etcd "github.com/coreos/etcd/client"
 	"github.com/coreos/etcd/pkg/transport"
-	etcd "github.com/coreos/go-etcd/etcd"
 	"github.com/golang/glog"
 	skymsg "github.com/skynetservices/skydns/msg"
 	flag "github.com/spf13/pflag"
+	"golang.org/x/net/context"
 	kapi "k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/api/endpoints"
 	"k8s.io/kubernetes/pkg/api/unversioned"
@@ -61,7 +61,7 @@ var (
 	argDomain              = flag.String("domain", "cluster.local", "domain under which to create names")
 	argEtcdMutationTimeout = flag.Duration("etcd-mutation-timeout", 10*time.Second, "crash after retrying etcd mutation for a specified duration")
 	argEtcdServer          = flag.String("etcd-server", "http://127.0.0.1:4001", "URL to etcd server")
-	argEtcdCAFile          = flag.String("etcd-cafile", "", "Certificate Authority to secure etcd communication")
+	argEtcdCAFile          = flag.String("etcd-cafile", "", "Certificate Authority file to secure etcd communication")
 	argEtcdCertFile        = flag.String("etcd-certfile", "", "TLS certificate file to secure etcd communication")
 	argEtcdKeyFile         = flag.String("etcd-keyfile", "", "TLS key file to secure etcd communication")
 	argKubecfgFile         = flag.String("kubecfg-file", "", "Location of kubecfg file for access to kubernetes master service; --kube-master-url overrides the URL part of this; if neither this nor --kube-master-url are provided, defaults to service account tokens")
@@ -72,20 +72,26 @@ var (
 const (
 	// Maximum number of attempts to connect to etcd server.
 	maxConnectAttempts = 12
+	// pollInterval defines the amount of time between etcd connection attempts
+	pollInterval = 5 * time.Second
+	// pollTimeout defines the total amount of time to attempt connecting to etcd
+	pollTimeout = 60 * time.Second
 	// Resync period for the kube controller loop.
 	resyncPeriod = 30 * time.Minute
 	// A subdomain added to the user specified domain for all services.
 	serviceSubdomain = "svc"
 	// A subdomain added to the user specified dmoain for all pods.
 	podSubdomain = "pod"
+	// kube2skyContext is the name of the context used with etcd API
+	kube2skyContext = "kube2sky"
 )
 
 type etcdConfig etcdstorage.EtcdConfig
 
-type etcdClient interface {
-	Set(path, value string, ttl uint64) (*etcd.Response, error)
-	RawGet(key string, sort, recursive bool) (*etcd.RawResponse, error)
-	Delete(path string, recursive bool) (*etcd.Response, error)
+type etcdKeysAPI interface {
+	Set(context context.Context, key, value string, options *etcd.SetOptions) (*etcd.Response, error)
+	Get(context context.Context, key string, options *etcd.GetOptions) (*etcd.Response, error)
+	Delete(context context.Context, key string, options *etcd.DeleteOptions) (*etcd.Response, error)
 }
 
 type nameNamespace struct {
@@ -93,9 +99,24 @@ type nameNamespace struct {
 	namespace string
 }
 
+// newKube2Sky creates a new instance of Kubernetes to SkyDNS bridge
+func newKube2Sky(config *etcdConfig, domain string, mutationTimeout time.Duration) (ks *kube2sky, err error) {
+	ks = &kube2sky{
+		domain:              domain,
+		etcdMutationTimeout: mutationTimeout,
+	}
+
+	var etcdClient etcd.Client
+	if etcdClient, err = newEtcdClient(config); err != nil {
+		return nil, fmt.Errorf("Failed to create etcd client: %v", err)
+	}
+	ks.etcdKeysAPI = etcd.NewKeysAPI(etcdClient)
+	return ks, nil
+}
+
 type kube2sky struct {
-	// Etcd client.
-	etcdClient etcdClient
+	// Etcd key/value interaction API.
+	etcdKeysAPI etcdKeysAPI
 	// DNS domain name.
 	domain string
 	// Etcd mutation timeout.
@@ -113,21 +134,30 @@ type kube2sky struct {
 // Removes 'subdomain' from etcd.
 func (ks *kube2sky) removeDNS(subdomain string) error {
 	glog.V(2).Infof("Removing %s from DNS", subdomain)
-	resp, err := ks.etcdClient.RawGet(skymsg.Path(subdomain), false, true)
+	ctx := newContext()
+	opts := &etcd.GetOptions{
+		Recursive: true,
+	}
+	resp, err := ks.etcdKeysAPI.Get(ctx, skymsg.Path(subdomain), opts)
 	if err != nil {
 		return err
 	}
-	if resp.StatusCode == http.StatusNotFound {
+	if resp.Node == nil {
 		glog.V(2).Infof("Subdomain %q does not exist in etcd", subdomain)
 		return nil
 	}
-	_, err = ks.etcdClient.Delete(skymsg.Path(subdomain), true)
+	deleteOpts := &etcd.DeleteOptions{
+		Recursive: true,
+	}
+	_, err = ks.etcdKeysAPI.Delete(ctx, skymsg.Path(subdomain), deleteOpts)
 	return err
 }
 
 func (ks *kube2sky) writeSkyRecord(subdomain string, data string) error {
 	// Set with no TTL, and hope that kubernetes events are accurate.
-	_, err := ks.etcdClient.Set(skymsg.Path(subdomain), data, uint64(0))
+	ctx := newContext()
+	opts := &etcd.SetOptions{}
+	_, err := ks.etcdKeysAPI.Set(ctx, skymsg.Path(subdomain), data, opts)
 	return err
 }
 
@@ -449,44 +479,20 @@ func (ks *kube2sky) updateService(oldObj, newObj interface{}) {
 	ks.newService(newObj)
 }
 
-func newEtcdClient(config *etcdConfig) (*etcd.Client, error) {
-	var (
-		client *etcd.Client
-		err    error
-	)
-	// FIXME: validate config.ServerList
-	etcdServer := config.ServerList[0]
-	transport, err := config.newTransport()
-	if err != nil {
-		return nil, fmt.Errorf("unable to create HTTP transport: %v", err)
-	}
-	httpClient := &http.Client{
-		Transport: transport,
-	}
-	for attempt := 1; attempt <= maxConnectAttempts; attempt++ {
-		if _, err = getEtcdVersion(httpClient, etcdServer); err == nil {
-			break
-		}
-		glog.Infof("cannot get etcd version: %v\n", err)
-		if attempt == maxConnectAttempts {
-			break
-		}
-		glog.Infof("[Attempt: %d] Attempting access to etcd after 5 second sleep", attempt)
-		time.Sleep(5 * time.Second)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to etcd server: %v, error: %v", etcdServer, err)
-	}
-	glog.Infof("Etcd server found: %v", etcdServer)
-
+func newEtcdClient(config *etcdConfig) (client etcd.Client, err error) {
+	ctx := newContext()
 	// loop until we have > 0 machines && machines[0] != ""
-	poll, timeout := 1*time.Second, 10*time.Second
+	poll, timeout := pollInterval, pollTimeout
 	if err := wait.Poll(poll, timeout, func() (bool, error) {
 		if client, err = config.newClient(); err != nil {
-			return false, fmt.Errorf("cannot create etcd client: %v", err)
+			glog.Infof("cannot create etcd client: %v", err)
+			return false, nil
 		}
-		client.SyncCluster()
-		machines := client.GetCluster()
+		if err = client.Sync(ctx); err != nil {
+			glog.Infof("cannot sync cluster: %v", err)
+			return false, nil
+		}
+		machines := client.Endpoints()
 		if len(machines) == 0 || len(machines[0]) == 0 {
 			return false, nil
 		}
@@ -508,48 +514,34 @@ func expandKubeMasterURL() (string, error) {
 	return parsedURL.String(), nil
 }
 
-// getEtcdVersion performs a version check against the provided Etcd server,
-// returning the string response, and error (if any).
-// Adopted from k8s.io/kubernetes/pkg/storage/etcd/util/etcd_util.go to allow
-// using a HTTPS client
-func getEtcdVersion(client *http.Client, host string) (string, error) {
-	response, err := client.Get(host + "/version")
+func (c *etcdConfig) newClient() (client etcd.Client, err error) {
+	transport, err := c.newTransport()
 	if err != nil {
-		return "", err
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("unsuccessful response from etcd server %q: %v", host, err)
-	}
-	versionBytes, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return "", err
-	}
-	return string(versionBytes), nil
-}
-
-func (c *etcdConfig) newClient() (client *etcd.Client, err error) {
-	if c.CAFile != "" {
-		client, err = etcd.NewTLSClient(c.ServerList, c.CertFile, c.KeyFile, c.CAFile)
-	} else {
-		client = etcd.NewClient(c.ServerList)
+		return nil, err
 	}
 
-	return client, err
+	client, err = etcd.New(etcd.Config{
+		Endpoints: c.ServerList,
+		Transport: transport,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return client, nil
 }
+
 func (c *etcdConfig) newTransport() (*http.Transport, error) {
 	info := transport.TLSInfo{
+		CAFile:   c.CAFile,
 		CertFile: c.CertFile,
 		KeyFile:  c.KeyFile,
-		CAFile:   c.CAFile,
 	}
 	tlsConfig, err := info.ClientConfig()
 	if err != nil {
 		return nil, err
 	}
 
-	// Copied from etcd.DefaultTransport declaration.
-	// TODO: Determine if transport needs optimization
 	transport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		Dial: (&net.Dialer{
@@ -707,32 +699,51 @@ func setupHealthzHandlers(ks *kube2sky) {
 	})
 }
 
+func validateArgs() error {
+	if *argEtcdServer == "" {
+		return fmt.Errorf("etcd server required")
+	}
+	if *argDomain == "" {
+		return fmt.Errorf("cluster domain required")
+	}
+	parsed, err := url.Parse(*argEtcdServer)
+	if err != nil {
+		return err
+	}
+	if parsed.Scheme == "https" && (*argEtcdCertFile == "" || *argEtcdKeyFile == "") {
+		return fmt.Errorf("both cert and key files must be provided for HTTPS")
+	}
+	// TODO: Validate other input flags.
+	return nil
+}
+
+func newContext() context.Context {
+	return kapi.WithNamespace(kapi.NewContext(), kube2skyContext)
+}
+
 func main() {
 	flag.CommandLine.SetNormalizeFunc(util.WarnWordSepNormalizeFunc)
 	flag.Parse()
 	var err error
 	setupSignalHandlers()
-	// TODO: Validate input flags.
+	if err = validateArgs(); err != nil {
+		glog.Fatalf("Error parsing command line: %v", err)
+	}
 	domain := *argDomain
 	if !strings.HasSuffix(domain, ".") {
 		domain = fmt.Sprintf("%s.", domain)
 	}
-	ks := kube2sky{
-		domain:              domain,
-		etcdMutationTimeout: *argEtcdMutationTimeout,
-	}
 
 	etcdConfig := &etcdConfig{
 		ServerList: []string{*argEtcdServer},
-	}
-	if *argEtcdCAFile != "" {
-		etcdConfig.CAFile = *argEtcdCAFile
-		etcdConfig.CertFile = *argEtcdCertFile
-		etcdConfig.KeyFile = *argEtcdKeyFile
+		CAFile:     *argEtcdCAFile,
+		CertFile:   *argEtcdCertFile,
+		KeyFile:    *argEtcdKeyFile,
 	}
 
-	if ks.etcdClient, err = newEtcdClient(etcdConfig); err != nil {
-		glog.Fatalf("Failed to create etcd client - %v", err)
+	ks, err := newKube2Sky(etcdConfig, domain, *argEtcdMutationTimeout)
+	if err != nil {
+		glog.Fatalf("Failed to create kube2sky: %v", err)
 	}
 
 	kubeClient, err := newKubeClient()
@@ -743,9 +754,9 @@ func main() {
 	ks.newService(waitForKubernetesService(kubeClient))
 	glog.Infof("Successfully added DNS record for Kubernetes service.")
 
-	ks.endpointsStore = watchEndpoints(kubeClient, &ks)
-	ks.servicesStore = watchForServices(kubeClient, &ks)
-	ks.podsStore = watchPods(kubeClient, &ks)
+	ks.endpointsStore = watchEndpoints(kubeClient, ks)
+	ks.servicesStore = watchForServices(kubeClient, ks)
+	ks.podsStore = watchPods(kubeClient, ks)
 
 	// We declare kube2sky ready when:
 	// 1. It has retrieved the Kubernetes master service from the apiserver. If this
@@ -753,6 +764,6 @@ func main() {
 	//    perform any cluster local DNS lookups.
 	// 2. It has setup the 3 watches above.
 	// Once ready this container never flips to not-ready.
-	setupHealthzHandlers(&ks)
+	setupHealthzHandlers(ks)
 	glog.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", *healthzPort), nil))
 }
